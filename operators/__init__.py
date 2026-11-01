@@ -1,6 +1,7 @@
 if "bpy" not in locals():
     from . import file_transfer
     from . import cascadeur
+    from . import tween
     from . import addon_properties
     from . import preferences
     from . import settings
@@ -11,6 +12,7 @@ else:
 
     importlib.reload(file_transfer)
     importlib.reload(cascadeur)
+    importlib.reload(tween)
     importlib.reload(addon_properties)
     importlib.reload(preferences)
     importlib.reload(settings)
@@ -19,6 +21,7 @@ else:
 
 classes = [
     file_transfer.CBB_OT_export_blender_fbx,
+    tween.CBB_OT_tween_blocked_animation,
     file_transfer.CBB_OT_import_cascadeur_fbx,
     file_transfer.CBB_OT_import_action_to_selected,
     cascadeur.CBB_OT_start_cascadeur,

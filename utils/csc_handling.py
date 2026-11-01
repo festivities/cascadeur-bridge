@@ -31,6 +31,7 @@ class CascadeurHandler:
         "temp_batch_exporter.py",
         "temp_exporter.py",
         "temp_importer.py",
+        "temp_tween.py",
     )
 
     @property

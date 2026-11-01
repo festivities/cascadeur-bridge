@@ -25,6 +25,7 @@ For a visual introduction watch the youtube video:
 
 - Start Cascadeur from Blender
 - Export from Blender to Cascadeur (Model, Scene, Animation)
+- Tween a blocked action in Cascadeur and bring the inbetweens back
 - Import from Cascadeur to Blender (Model, Scene, Animation)
 - Import animation to selected armature
 - Batch import all opened scenes and actions from Cascadeur
@@ -84,6 +85,14 @@ The add-on is available in the **CSC Bridge** tab of Blender's **3D Viewport N-p
 #### Export to Cascadeur
 
 Exports the current Blender scene/model/animation to Cascadeur.
+
+#### Tween Blocked Animation
+
+Sends the active action's key poses to Cascadeur, runs inbetweening, and writes the result back as a new action named `<action>_csc_tween`.
+
+The armature needs at least two keyed frames. CloudRig and other control rigs are baked from their deform bones, so the control curves stay in the new action and the deform bones carry the tween. Gaps longer than 120 frames stay linear; Cascadeur's inbetweening cannot fill those.
+
+Re-run **Install Requirements** after updating so Cascadeur gets the tween script.
 
 ### Import
 

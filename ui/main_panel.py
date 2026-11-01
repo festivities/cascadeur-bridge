@@ -111,6 +111,12 @@ class CBB_PT_parent_panel(PanelBasics, bpy.types.Panel):
             text="Export To Cascadeur",
             icon="EXPORT",
         )
+        row = col.row()
+        row.operator(
+            "cbb.tween_blocked_animation",
+            text="Tween Blocked Animation",
+            icon="IPO_BEZIER",
+        )
 
     def _draw_cascadeur_to_blender(self, layout, addon_props):
         box = layout.box()
