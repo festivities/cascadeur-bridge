@@ -106,21 +106,19 @@ def insert_visual_key(pose_bone, frame):
 
 
 def _bone_rest(armature):
-    previous_active = bpy.context.view_layer.objects.active
-    previous_mode = previous_active.mode if previous_active else "OBJECT"
-    bpy.context.view_layer.objects.active = armature
-    if armature.mode != "EDIT":
-        bpy.ops.object.mode_set(mode="EDIT")
-    rest = {
-        bone.name: (bone.head.copy(), bone.tail.copy(), bone.roll)
-        for bone in armature.data.edit_bones
-        if bone.use_deform
-    }
-    bpy.ops.object.mode_set(mode="OBJECT")
-    if previous_active:
-        bpy.context.view_layer.objects.active = previous_active
-        if previous_mode != "OBJECT":
-            bpy.ops.object.mode_set(mode=previous_mode)
+    # Library overrides cannot enter edit mode. Pose bones already store rest.
+    rest = {}
+    for bone in armature.data.bones:
+        if not bone.use_deform:
+            continue
+        head = bone.head_local.copy()
+        tail = bone.tail_local.copy()
+        axis = tail - head
+        if axis.length == 0.0:
+            roll = 0.0
+        else:
+            _axis, roll = bone.AxisRollFromMatrix(bone.matrix_local.to_3x3(), axis=axis)
+        rest[bone.name] = (head, tail, roll)
     return rest
 
 
@@ -135,21 +133,39 @@ def build_deform_armature(source, name):
 
     arm_data = bpy.data.armatures.new(name)
     obj = bpy.data.objects.new(name, arm_data)
-    collection = source.users_collection[0] if source.users_collection else bpy.context.scene.collection
-    collection.objects.link(obj)
+    # Keep the temp rig out of a linked or override collection.
+    bpy.context.scene.collection.objects.link(obj)
     obj.matrix_world = source.matrix_world.copy()
 
+    previous_active = bpy.context.view_layer.objects.active
+    previous_selected = [item for item in bpy.context.selected_objects]
+    previous_mode = previous_active.mode if previous_active else "OBJECT"
+    # mode_set edits every selected armature. An override cannot enter edit mode.
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode="EDIT")
-    for bone_name, (head, tail, roll) in rest.items():
-        edit_bone = arm_data.edit_bones.new(bone_name)
-        edit_bone.head = head
-        edit_bone.tail = tail
-        edit_bone.roll = roll
-    for bone_name, parent_name in parents.items():
-        if parent_name:
-            arm_data.edit_bones[bone_name].parent = arm_data.edit_bones[parent_name]
-    bpy.ops.object.mode_set(mode="OBJECT")
+    try:
+        bpy.ops.object.mode_set(mode="EDIT")
+        for bone_name, (head, tail, roll) in rest.items():
+            edit_bone = arm_data.edit_bones.new(bone_name)
+            edit_bone.head = head
+            edit_bone.tail = tail
+            edit_bone.roll = roll
+        for bone_name, parent_name in parents.items():
+            if parent_name and parent_name in arm_data.edit_bones:
+                arm_data.edit_bones[bone_name].parent = arm_data.edit_bones[parent_name]
+        bpy.ops.object.mode_set(mode="OBJECT")
+    finally:
+        if obj.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.select_all(action="DESELECT")
+        for item in previous_selected:
+            if item.name in bpy.data.objects:
+                item.select_set(True)
+        if previous_active and previous_active.name in bpy.data.objects:
+            bpy.context.view_layer.objects.active = previous_active
+            if previous_mode not in {"OBJECT", "EDIT"} and previous_active.mode != previous_mode:
+                bpy.ops.object.mode_set(mode=previous_mode)
     return obj
 
 

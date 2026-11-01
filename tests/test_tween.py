@@ -39,6 +39,8 @@ def run_self_check():
     parents = tween.deform_parent_map(plain)
     assert parents["spine"] == "hips", parents
     assert parents["hips"] is None, parents
+    rest = tween._bone_rest(plain)
+    assert set(rest) == {"hips", "spine"}, rest
 
     rig = _armature(
         "CSC_TEST_CLOUDRIG",
