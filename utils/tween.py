@@ -175,71 +175,180 @@ def frame_pairs(imported_action, our_start, our_end):
     return [(our_start + index, imported_start + index) for index in range(count)]
 
 
-def _blend_matrix(left, right, factor):
-    from mathutils import Matrix
-
-    location = left.to_translation().lerp(right.to_translation(), factor)
-    rotation = left.to_quaternion().slerp(right.to_quaternion(), factor)
-    scale = left.to_scale().lerp(right.to_scale(), factor)
-    return Matrix.LocRotScale(location, rotation, scale)
+def _local_quat(pose_bone):
+    if pose_bone.rotation_mode == "QUATERNION":
+        return pose_bone.rotation_quaternion.copy()
+    return pose_bone.rotation_euler.to_quaternion()
 
 
-def _world_matrices(obj, names):
-    bpy.context.view_layer.update()
-    return {name: (obj.matrix_world @ obj.pose.bones[name].matrix).copy() for name in names}
+def _set_local_quat(pose_bone, quat, previous_euler=None):
+    if pose_bone.rotation_mode == "QUATERNION":
+        pose_bone.rotation_quaternion = quat
+        return None
+    euler = quat.to_euler(pose_bone.rotation_mode, previous_euler)
+    pose_bone.rotation_euler = euler
+    return euler
 
 
-def apply_world_poses(source, imported, frames, key_frames=None):
-    """Key source deform bones so the visual pose matches the imported tween.
+def _keyed_controls(armature, action, slot):
+    names = set()
+    for fcurve in action_fcurves(action, slot):
+        if not fcurve.data_path.startswith('pose.bones["'):
+            continue
+        name = fcurve.data_path.split('"')[1]
+        bone = armature.pose.bones.get(name)
+        if bone and not bone.bone.use_deform:
+            names.add(name)
+    return names
 
-    frames is a list of source frames, or (source_frame, imported_frame) pairs.
-    key_frames stay on the original blocking pose. In-betweens follow Cascadeur's
-    motion between those keys.
-    shortcut: keyframe_insert per bone per frame, switch to fcurve insert if long actions hitch.
+
+def _deform_name(control_name):
+    if "-" in control_name and control_name.split("-", 1)[0] in {
+        "FK",
+        "IK",
+        "CTR",
+        "TGT",
+        "POLE",
+    }:
+        return "DEF-" + control_name.split("-", 1)[1]
+    return "DEF-" + control_name
+
+
+def _driver_control(armature, def_name, controls):
+    pose_bone = armature.pose.bones.get(def_name)
+    node = pose_bone.parent if pose_bone else None
+    while node:
+        for constraint in node.constraints:
+            if (
+                constraint.type == "COPY_TRANSFORMS"
+                and getattr(constraint, "influence", 1.0) > 0.5
+                and constraint.subtarget in controls
+            ):
+                return constraint.subtarget
+        node = node.parent
+    stripped = def_name[4:] if def_name.startswith("DEF-") else def_name
+    for prefix in ("FK-", "IK-", ""):
+        candidate = prefix + stripped
+        if candidate in controls:
+            return candidate
+    return None
+
+
+def _remap_quats(samples, dst_start, dst_end):
+    src_start = samples[0].copy()
+    src_end = samples[-1].copy()
+    left = dst_start @ src_start.inverted()
+    right = dst_end @ src_end.inverted()
+    last = max(len(samples) - 1, 1)
+    return [left.slerp(right, index / last) @ quat for index, quat in enumerate(samples)]
+
+
+def _remove_fcurves(action, slot, bone_names):
+    prefixes = tuple(f'pose.bones["{name}"]' for name in bone_names)
+    if not prefixes or slot is None or not getattr(action, "layers", None):
+        return
+    for layer in action.layers:
+        for strip in getattr(layer, "strips", []):
+            bag = None
+            try:
+                bag = strip.channelbag(slot)
+            except Exception:
+                bag = None
+            if bag is None:
+                continue
+            for fcurve in list(bag.fcurves):
+                if fcurve.data_path.startswith(prefixes):
+                    bag.fcurves.remove(fcurve)
+
+
+def apply_control_tween(source, imported, frames, key_frames=None):
+    """Write Cascadeur's in-betweens onto the controls that drive the rig.
+
+    Deform bones are left alone so they keep following those controls.
+    Blocking-key rotations are kept. shortcut: keyframe_insert per control per
+    frame, switch to fcurve insert if long actions hitch.
     """
     if frames and not isinstance(frames[0], tuple):
         frames = [(frame, frame) for frame in frames]
-    shared = [
-        name
-        for name in source.pose.bones.keys()
-        if source.pose.bones[name].bone.use_deform and name in imported.pose.bones
-    ]
-    scene = bpy.context.scene
     pair_by_source = dict(frames)
     keys = [frame for frame in sorted(key_frames or []) if frame in pair_by_source]
-    source_keys = {}
-    imported_keys = {}
+    if len(frames) < 2 or not keys:
+        return 0
+
+    animation = source.animation_data
+    action = animation.action if animation else None
+    slot = animation.action_slot if animation else None
+    controls = _keyed_controls(source, action, slot) if action else set()
+    driven = {}
+    for name in list(imported.pose.bones.keys()):
+        if name not in source.pose.bones or not source.pose.bones[name].bone.use_deform:
+            continue
+        control = _driver_control(source, name, controls) or _driver_control(
+            source, name, set(source.pose.bones.keys())
+        )
+        preferred = _deform_name(control) if control else None
+        if control and (control not in driven or name == preferred):
+            driven[control] = name
+    if not driven:
+        return 0
+
+    scene = bpy.context.scene
+    imported_samples = {control: [] for control in driven}
+    for _source_frame, imported_frame in frames:
+        scene.frame_set(imported_frame)
+        bpy.context.view_layer.update()
+        for control, def_name in driven.items():
+            imported_samples[control].append(
+                imported.pose.bones[def_name].matrix_basis.to_quaternion()
+            )
+
+    keyed_rotation = {}
     for frame in keys:
         scene.frame_set(frame)
-        source_keys[frame] = _world_matrices(source, shared)
-        scene.frame_set(pair_by_source[frame])
-        imported_keys[frame] = _world_matrices(imported, shared)
-
-    for source_frame, imported_frame in frames:
-        scene.frame_set(imported_frame)
-        imported_now = _world_matrices(imported, shared)
-        scene.frame_set(source_frame)
         bpy.context.view_layer.update()
-        left = right = factor = None
-        if keys:
-            left = max(frame for frame in keys if frame <= source_frame)
-            right = min(frame for frame in keys if frame >= source_frame)
-            factor = 0.0 if left == right else (source_frame - left) / (right - left)
-        for name in shared:
-            if keys:
-                from_left = (
-                    source_keys[left][name]
-                    @ imported_keys[left][name].inverted()
-                    @ imported_now[name]
-                )
-                from_right = (
-                    source_keys[right][name]
-                    @ imported_keys[right][name].inverted()
-                    @ imported_now[name]
-                )
-                desired_world = _blend_matrix(from_left, from_right, factor)
+        for control in driven:
+            keyed_rotation[control, frame] = _local_quat(source.pose.bones[control])
+
+    frame_index = {frame: index for index, (frame, _imported) in enumerate(frames)}
+    written = 0
+    for control, def_name in driven.items():
+        samples = imported_samples[control]
+        remapped = [None] * len(samples)
+        if control in controls:
+            intervals = list(zip(keys, keys[1:]))
+        else:
+            rest = _local_quat(source.pose.bones[control])
+            keyed_rotation[control, keys[0]] = rest
+            keyed_rotation[control, keys[-1]] = rest
+            intervals = [(keys[0], keys[-1])]
+        for left, right in intervals:
+            start = frame_index[left]
+            end = frame_index[right]
+            chunk = _remap_quats(
+                samples[start : end + 1],
+                keyed_rotation[control, left],
+                keyed_rotation[control, right],
+            )
+            remapped[start : end + 1] = chunk
+        pose_bone = source.pose.bones[control]
+        previous = None
+        for (source_frame, _imported_frame), quat in zip(frames, remapped):
+            if quat is None:
+                continue
+            if source_frame in keyed_rotation and control in controls:
+                quat = keyed_rotation[control, source_frame]
+            scene.frame_set(source_frame)
+            previous = _set_local_quat(pose_bone, quat, previous)
+            if pose_bone.rotation_mode == "QUATERNION":
+                pose_bone.keyframe_insert("rotation_quaternion", frame=source_frame)
             else:
-                desired_world = imported_now[name]
-            source.pose.bones[name].matrix = source.matrix_world.inverted() @ desired_world
-            insert_visual_key(source.pose.bones[name], source_frame)
-    return len(shared)
+                pose_bone.keyframe_insert("rotation_euler", frame=source_frame)
+        written += 1
+
+    if action is not None:
+        _remove_fcurves(
+            action,
+            slot,
+            [bone.name for bone in source.data.bones if bone.use_deform],
+        )
+    return written

@@ -62,6 +62,15 @@ def run_self_check():
     frames = tween.keyed_frames(action, slot)
     assert frames == [1, 11], frames
 
+    from mathutils import Quaternion
+
+    start = Quaternion((1, 0, 0, 0))
+    end = Quaternion((0, 1, 0, 0))
+    mid = start.slerp(end, 0.5)
+    remapped = tween._remap_quats([start, mid, end], start, end)
+    assert (remapped[0] - start).magnitude < 1e-5, remapped[0]
+    assert (remapped[-1] - end).magnitude < 1e-5, remapped[-1]
+
     for obj in (plain, rig):
         bpy.data.objects.remove(obj, do_unlink=True)
     return "ok"

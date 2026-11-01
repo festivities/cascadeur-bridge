@@ -90,7 +90,7 @@ Exports the current Blender scene/model/animation to Cascadeur.
 
 Sends the active action's key poses to Cascadeur, runs inbetweening, and writes the result back as a new action named `<action>_csc_tween`.
 
-The armature needs at least two keyed frames. CloudRig and other control rigs are baked from their deform bones, so the control curves stay in the new action and the deform bones carry the tween. Gaps longer than 120 frames stay linear; Cascadeur's inbetweening cannot fill those.
+The armature needs at least two keyed frames. CloudRig and other control rigs keep their deform bones driven by the controls: the tween is written onto the controls you keyed, so a posed `FK` bone rotates through the in-betweens instead of the deform bone sliding off it. Gaps longer than 120 frames stay linear; Cascadeur's inbetweening cannot fill those.
 
 Re-run **Install Requirements** after updating so Cascadeur gets the tween script.
 

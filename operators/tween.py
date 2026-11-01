@@ -174,7 +174,7 @@ class CBB_OT_tween_blocked_animation(OperatorBaseClass):
             self.frames[0],
             self.frames[-1],
         )
-        tween.apply_world_poses(armature, imported_arm, pairs, self.frames)
+        tween.apply_control_tween(armature, imported_arm, pairs, self.frames)
 
         for obj in [obj for obj in bpy.data.objects if obj not in before]:
             bpy.data.objects.remove(obj, do_unlink=True)
