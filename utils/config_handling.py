@@ -7,7 +7,17 @@ import pathlib
 from .csc_handling import CascadeurHandler
 from ..addon_info import PACKAGE_NAME
 
-addon_dir = pathlib.Path(bpy.utils.extension_path_user(PACKAGE_NAME, create=True))
+
+def _user_addon_dir():
+    # The repo folder is cascadeur-bridge. Blender rejects that package name.
+    parts = PACKAGE_NAME.split(".")
+    if len(parts) == 3:
+        parts[2] = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in parts[2])
+    package = ".".join(parts)
+    return pathlib.Path(bpy.utils.extension_path_user(package, create=True))
+
+
+addon_dir = _user_addon_dir()
 config_path = os.path.join(addon_dir, "settings.cfg")
 
 
