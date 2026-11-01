@@ -3,6 +3,31 @@
 This file is for an outside agent investigating why the result of this work did not
 match the user's expectations. Read this before changing anything.
 
+## Resolution (2026-11-01)
+
+Root causes found and fixed; the sections below describe the state before the fix.
+
+1. **Send was corrupt.** `key_blocking_poses` assigned `pose_bone.matrix` child by child
+   without a depsgraph update, so each child solved against its parent's stale pose.
+   Cascadeur received garbage poses. It now solves `matrix_basis` from the source poses
+   (`Bone.convert_local_to_pose`). Verified: export -> FBX import of `RIG-attack`
+   reproduces every DEF bone within 0.0006 / 0 deg on 142-168.
+2. **Return remapped local quaternions onto the wrong controls.** `apply_control_tween`
+   was removed. Tween now uses `apply_control_poses`: per frame,
+   `control = desired_def @ live_def^-1 @ live_control`. Controls come from the *last*
+   active COPY_TRANSFORMS (IK wins over FK), visible bone collections, and a climb from
+   hidden IK mechanism to the IK foot control. IK thigh/shin and tweak bones riding on
+   mechanism (twist, face, hair) are not keyed. On `RIG-attack`: 52 controls incl.
+   `HIP-spine`, `IK-foot.L/R`, FK arms/spine/fingers, `center`.
+3. `_clear_range` crashed removing keys (stale references); now removes back to front.
+   DEF keys are no longer cleared.
+4. A broken earlier run overwrote `RIG-attackAction`: FK rotations keyed on every frame
+   142-168, so every frame counted as a blocking key. `RIG-attackAction_blocking`
+   (made in the live session, unsaved at time of writing) keeps only 142/145/150/154/159.
+
+Known limit: IK knees follow the existing pole, not Cascadeur's knee direction.
+Not yet verified: a fresh Cascadeur round trip with the fixed send.
+
 ## What the user wants
 
 The user animates a CloudRig character in Blender with sparse, blocked key poses on

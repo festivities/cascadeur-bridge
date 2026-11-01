@@ -56,6 +56,26 @@ def run_self_check():
     assert tween.is_control_rig(rig)
     assert not tween.is_control_rig(plain)
 
+    # Posed parent and child: the temp deform chain must reproduce both on the first key.
+    rig.pose.bones["spine"].rotation_mode = "XYZ"
+    rig.pose.bones["spine"].rotation_euler = (0.5, 0.0, 0.3)
+    rig.pose.bones["upper_arm.L"].rotation_mode = "XYZ"
+    rig.pose.bones["upper_arm.L"].rotation_euler = (0.0, 0.7, 0.0)
+    bpy.context.view_layer.update()
+    temp = tween.build_deform_armature(rig, "CSC_TEST_TEMP")
+    tween.key_blocking_poses(rig, temp, [1])
+    bpy.context.scene.frame_set(1)
+    bpy.context.view_layer.update()
+    for name in ("DEF-spine", "DEF-upper_arm.L"):
+        delta = rig.pose.bones[name].matrix.inverted() @ temp.pose.bones[name].matrix
+        off = max(abs(delta[i][j] - (i == j)) for i in range(4) for j in range(4))
+        assert off < 1e-4, (name, delta)
+    temp_action = temp.animation_data.action
+    bpy.data.objects.remove(temp, do_unlink=True)
+    temp_action.use_fake_user = False
+    rig.pose.bones["spine"].rotation_euler = (0, 0, 0)
+    rig.pose.bones["upper_arm.L"].rotation_euler = (0, 0, 0)
+
     driver = _armature(
         "CSC_TEST_DRIVER",
         [
@@ -119,16 +139,30 @@ def run_self_check():
     assert tween.shot_frames(action, slot, 5, 8) == [5, 8]
     scene.frame_start, scene.frame_end = old_range
 
-    from mathutils import Quaternion
+    # IK/FK switch: the later, active copy wins; an IK-driven DEF is left to the IK solve.
+    switch = _armature(
+        "CSC_TEST_SWITCH",
+        [
+            ("root", None, (0, 0, 0), (0, 0, 0.2), False),
+            ("FK-bone", "root", (0, 0, 0), (0, 0, 1), False),
+            ("IK-M-bone", "root", (0, 0, 0), (0, 0, 1), False),
+            ("IK-M-tip", "IK-M-bone", (0, 0, 1), (0, 0, 2), False),
+            ("IK-target", "root", (0, 0, 2), (0, 0, 2.2), False),
+            ("mech", "root", (0, 0, 0), (0, 0, 1), False),
+            ("DEF-bone", "mech", (0, 0, 0), (0, 0, 1), True),
+        ],
+    )
+    for subtarget in ("FK-bone", "IK-M-bone"):
+        item = switch.pose.bones["mech"].constraints.new("COPY_TRANSFORMS")
+        item.target, item.subtarget = switch, subtarget
+    ik = switch.pose.bones["IK-M-tip"].constraints.new("IK")
+    ik.target, ik.subtarget, ik.chain_count = switch, "IK-target", 2
+    ik_bones = tween._ik_chain_bones(switch)
+    assert tween._control_for(switch, "DEF-bone", ik_bones)[0] is None
+    switch.pose.bones["mech"].constraints[1].influence = 0.0
+    assert tween._control_for(switch, "DEF-bone", ik_bones)[0] == "FK-bone"
 
-    start = Quaternion((1, 0, 0, 0))
-    end = Quaternion((0, 1, 0, 0))
-    mid = start.slerp(end, 0.5)
-    remapped = tween._remap_quats([start, mid, end], start, end)
-    assert (remapped[0] - start).magnitude < 1e-5, remapped[0]
-    assert (remapped[-1] - end).magnitude < 1e-5, remapped[-1]
-
-    for obj in (plain, rig, driver, imported):
+    for obj in (plain, rig, driver, imported, switch):
         bpy.data.objects.remove(obj, do_unlink=True)
     for action in list(bpy.data.actions):
         if action.name.startswith("CSC_TEST"):

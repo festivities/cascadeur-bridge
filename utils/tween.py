@@ -182,8 +182,20 @@ def key_blocking_poses(source, target, frames):
     for frame in frames:
         bpy.context.scene.frame_set(frame)
         bpy.context.view_layer.update()
+        # Solve the basis from the source poses directly. Assigning pose_bone.matrix
+        # would solve each child against its parent's stale, last-evaluated pose.
         for name in shared:
-            target.pose.bones[name].matrix = source.pose.bones[name].matrix.copy()
+            bone = target.data.bones[name]
+            pose = source.pose.bones[name].matrix
+            if bone.parent:
+                parent_pose = source.pose.bones[bone.parent.name].matrix
+                basis = bone.convert_local_to_pose(
+                    pose, bone.matrix_local, parent_matrix=parent_pose,
+                    parent_matrix_local=bone.parent.matrix_local, invert=True,
+                )
+            else:
+                basis = bone.convert_local_to_pose(pose, bone.matrix_local, invert=True)
+            target.pose.bones[name].matrix_basis = basis
             insert_visual_key(target.pose.bones[name], frame)
     return action
 
@@ -216,78 +228,6 @@ def frame_pairs(imported_action, our_start, our_end):
     return [(our_start + index, imported_start + index) for index in range(count)]
 
 
-def _local_quat(pose_bone):
-    if pose_bone.rotation_mode == "QUATERNION":
-        return pose_bone.rotation_quaternion.copy()
-    return pose_bone.rotation_euler.to_quaternion()
-
-
-def _set_local_quat(pose_bone, quat, previous_euler=None):
-    if pose_bone.rotation_mode == "QUATERNION":
-        pose_bone.rotation_quaternion = quat
-        return None
-    euler = quat.to_euler(pose_bone.rotation_mode, previous_euler)
-    pose_bone.rotation_euler = euler
-    return euler
-
-
-def _keyed_controls(armature, action, slot):
-    names = set()
-    for fcurve in action_fcurves(action, slot):
-        if not fcurve.data_path.startswith('pose.bones["'):
-            continue
-        name = fcurve.data_path.split('"')[1]
-        bone = armature.pose.bones.get(name)
-        if bone and not bone.bone.use_deform:
-            names.add(name)
-    return names
-
-
-def _deform_name(control_name):
-    if "-" in control_name and control_name.split("-", 1)[0] in {
-        "FK",
-        "IK",
-        "CTR",
-        "TGT",
-        "POLE",
-    }:
-        return "DEF-" + control_name.split("-", 1)[1]
-    return "DEF-" + control_name
-
-
-def _driver_control(armature, def_name, controls):
-    pose_bone = armature.pose.bones.get(def_name)
-    node = pose_bone.parent if pose_bone else None
-    while node:
-        for constraint in node.constraints:
-            if (
-                constraint.type == "COPY_TRANSFORMS"
-                and getattr(constraint, "influence", 1.0) > 0.5
-                and constraint.subtarget in controls
-            ):
-                return constraint.subtarget
-        node = node.parent
-    stripped = def_name[4:] if def_name.startswith("DEF-") else def_name
-    for prefix in ("FK-", "IK-", ""):
-        candidate = prefix + stripped
-        if candidate in controls:
-            return candidate
-    return None
-
-
-def _remap_quats(samples, dst_start, dst_end):
-    src_start = samples[0].copy()
-    src_end = samples[-1].copy()
-    left = dst_start @ src_start.inverted()
-    right = dst_end @ src_end.inverted()
-    last = max(len(samples) - 1, 1)
-    return [left.slerp(right, index / last) @ quat for index, quat in enumerate(samples)]
-
-
-def _remove_fcurves(action, slot, bone_names):
-    _clear_range(action, slot, bone_names, None, None)
-
-
 def _clear_range(action, slot, bone_names, start, end):
     """Drop keys on these bones. A start/end keeps keys outside that span."""
     prefixes = tuple(f'pose.bones["{name}"]' for name in bone_names)
@@ -308,106 +248,13 @@ def _clear_range(action, slot, bone_names, start, end):
                 if start is None:
                     bag.fcurves.remove(fcurve)
                     continue
-                for key in list(fcurve.keyframe_points):
-                    if start - 0.001 <= key.co[0] <= end + 0.001:
-                        fcurve.keyframe_points.remove(key)
+                # Back to front: removing a key shifts the ones after it.
+                points = fcurve.keyframe_points
+                for index in reversed(range(len(points))):
+                    if start - 0.001 <= points[index].co[0] <= end + 0.001:
+                        points.remove(points[index])
                 if len(fcurve.keyframe_points) == 0:
                     bag.fcurves.remove(fcurve)
-
-
-def apply_control_tween(source, imported, frames, key_frames=None):
-    """Write Cascadeur's in-betweens onto the controls that drive the rig.
-
-    Deform bones are left alone so they keep following those controls.
-    Blocking-key rotations are kept. shortcut: keyframe_insert per control per
-    frame, switch to fcurve insert if long actions hitch.
-    """
-    if frames and not isinstance(frames[0], tuple):
-        frames = [(frame, frame) for frame in frames]
-    pair_by_source = dict(frames)
-    keys = [frame for frame in sorted(key_frames or []) if frame in pair_by_source]
-    if len(frames) < 2 or not keys:
-        return 0
-
-    animation = source.animation_data
-    action = animation.action if animation else None
-    slot = animation.action_slot if animation else None
-    controls = _keyed_controls(source, action, slot) if action else set()
-    driven = {}
-    for name in list(imported.pose.bones.keys()):
-        if name not in source.pose.bones or not source.pose.bones[name].bone.use_deform:
-            continue
-        control = _driver_control(source, name, controls) or _driver_control(
-            source, name, set(source.pose.bones.keys())
-        )
-        preferred = _deform_name(control) if control else None
-        if control and (control not in driven or name == preferred):
-            driven[control] = name
-    if not driven:
-        return 0
-
-    scene = bpy.context.scene
-    imported_samples = {control: [] for control in driven}
-    for _source_frame, imported_frame in frames:
-        scene.frame_set(imported_frame)
-        bpy.context.view_layer.update()
-        for control, def_name in driven.items():
-            imported_samples[control].append(
-                imported.pose.bones[def_name].matrix_basis.to_quaternion()
-            )
-
-    keyed_rotation = {}
-    for frame in keys:
-        scene.frame_set(frame)
-        bpy.context.view_layer.update()
-        for control in driven:
-            keyed_rotation[control, frame] = _local_quat(source.pose.bones[control])
-
-    frame_index = {frame: index for index, (frame, _imported) in enumerate(frames)}
-    written = 0
-    for control, def_name in driven.items():
-        samples = imported_samples[control]
-        remapped = [None] * len(samples)
-        if control in controls:
-            intervals = list(zip(keys, keys[1:]))
-        else:
-            rest = _local_quat(source.pose.bones[control])
-            keyed_rotation[control, keys[0]] = rest
-            keyed_rotation[control, keys[-1]] = rest
-            intervals = [(keys[0], keys[-1])]
-        for left, right in intervals:
-            start = frame_index[left]
-            end = frame_index[right]
-            chunk = _remap_quats(
-                samples[start : end + 1],
-                keyed_rotation[control, left],
-                keyed_rotation[control, right],
-            )
-            remapped[start : end + 1] = chunk
-        pose_bone = source.pose.bones[control]
-        previous = None
-        for (source_frame, _imported_frame), quat in zip(frames, remapped):
-            if quat is None:
-                continue
-            if source_frame in keyed_rotation and control in controls:
-                quat = keyed_rotation[control, source_frame]
-            scene.frame_set(source_frame)
-            previous = _set_local_quat(pose_bone, quat, previous)
-            if pose_bone.rotation_mode == "QUATERNION":
-                pose_bone.keyframe_insert("rotation_quaternion", frame=source_frame)
-            else:
-                pose_bone.keyframe_insert("rotation_euler", frame=source_frame)
-        written += 1
-
-    if action is not None and frames:
-        _clear_range(
-            action,
-            slot,
-            [bone.name for bone in source.data.bones if bone.use_deform],
-            min(frame for frame, _imported in frames),
-            max(frame for frame, _imported in frames),
-        )
-    return written
 
 
 def is_control_rig(armature):
@@ -491,19 +338,91 @@ def export_blocked_deform(armature, path):
     return None
 
 
-def _mechanism_driver(armature, def_name):
-    pose_bone = armature.pose.bones.get(def_name)
-    node = pose_bone.parent if pose_bone else None
+def _is_control(armature, bone):
+    """Animator-facing bone: in a visible bone collection. Rigs without collections count all."""
+    if not armature.data.collections_all:
+        return True
+    return any(collection.is_visible_effectively for collection in bone.collections)
+
+
+def _ik_chain_bones(armature):
+    chain = set()
+    for pose_bone in armature.pose.bones:
+        for constraint in pose_bone.constraints:
+            if constraint.type != "IK" or constraint.mute or constraint.influence <= 0.5:
+                continue
+            node, count = pose_bone, constraint.chain_count or 1000
+            while node and count > 0:
+                chain.add(node.name)
+                node, count = node.parent, count - 1
+    return chain
+
+
+def _active_copy(pose_bone):
+    # Later constraints win; an IK/FK switch puts the IK copy after the FK one.
+    active = None
+    for constraint in pose_bone.constraints:
+        if constraint.type == "COPY_TRANSFORMS" and not constraint.mute and constraint.influence > 0.5:
+            active = constraint.subtarget
+    return active
+
+
+def _driven(pose_bone):
+    return any(
+        not item.type.startswith("LIMIT_") and not item.mute and item.influence > 0.0
+        for item in pose_bone.constraints
+    )
+
+
+def _control_for(armature, def_name, ik_bones):
+    """The control the animator keys to move this DEF bone, and how many hops away it is.
+
+    None when the bone follows an IK solve (thigh/shin; the foot DEF reaches the IK
+    control), or when it is a tweak riding on a mechanism chain (twist, face, hair):
+    those follow the solved controls already.
+    """
+    bones = armature.data.bones
+    node = armature.pose.bones[def_name].parent
+    hops = 1
     while node:
-        for constraint in node.constraints:
-            if (
-                constraint.type == "COPY_TRANSFORMS"
-                and getattr(constraint, "influence", 1.0) > 0.5
-                and constraint.subtarget in armature.pose.bones
-            ):
-                return node.name, constraint.subtarget
-        node = node.parent
-    return None, None
+        target = _active_copy(node)
+        if target and target in armature.pose.bones:
+            if target in ik_bones:
+                return None, hops
+            control = armature.pose.bones[target]
+            if not _is_control(armature, bones[target]):
+                # Hidden mechanism (IK-M-foot): climb to the free visible control (IK-foot).
+                # ponytail: a hidden FK chain would climb too far; CloudRig shows the active chain.
+                climb = control.parent
+                while climb and climb.parent:
+                    if _is_control(armature, bones[climb.name]) and not _driven(climb):
+                        control = climb
+                        break
+                    climb = climb.parent
+            if control.name in ik_bones:
+                return None, hops
+            return control.name, hops
+        # A top-level bone (root) moves the whole rig; never solve onto it.
+        if node.parent and _is_control(armature, bones[node.name]):
+            rides_mechanism = any(_active_copy(parent) for parent in node.parent_recursive)
+            return (None if rides_mechanism else node.name), hops
+        node, hops = node.parent, hops + 1
+    return None, hops
+
+
+def _control_targets(source, imported):
+    ik_bones = _ik_chain_bones(source)
+    best = {}
+    for bone in source.data.bones:
+        if not bone.use_deform:
+            continue
+        imported_name = _imported_name(imported, bone.name)
+        if imported_name is None:
+            continue
+        control, hops = _control_for(source, bone.name, ik_bones)
+        if control and (control not in best or hops < best[control][0]):
+            best[control] = (hops, bone.name, imported_name)
+    return {control: (name, imported_name) for control, (_hops, name, imported_name) in best.items()}
 
 
 def _imported_name(imported, def_name):
@@ -513,36 +432,6 @@ def _imported_name(imported, def_name):
     if stripped and stripped in imported.pose.bones:
         return stripped
     return None
-
-
-def _control_targets(source, imported):
-    driven = {}
-    for name in source.pose.bones.keys():
-        if not source.pose.bones[name].bone.use_deform:
-            continue
-        imported_name = _imported_name(imported, name)
-        if imported_name is None:
-            continue
-        mechanism, control = _mechanism_driver(source, name)
-        if not control:
-            continue
-        preferred = _deform_name(control)
-        if control not in driven or name == preferred:
-            driven[control] = (mechanism, name, imported_name)
-    return driven
-
-
-def _parent_first(armature, names):
-    depth = {}
-
-    def _depth(name):
-        if name in depth:
-            return depth[name]
-        parent = armature.pose.bones[name].parent
-        depth[name] = 0 if parent is None or parent.name not in names else _depth(parent.name) + 1
-        return depth[name]
-
-    return sorted(names, key=_depth)
 
 
 def pose_frame_pairs(imported_action, start, end):
@@ -576,12 +465,30 @@ def _ensure_action(armature, action_name):
     return action
 
 
+def _key_compatible(pose_bone, frame, previous):
+    """Key the posed control without Euler or quaternion flips between frames."""
+    if pose_bone.rotation_mode == "QUATERNION":
+        if previous is not None:
+            quat = pose_bone.rotation_quaternion.copy()
+            quat.make_compatible(previous)
+            pose_bone.rotation_quaternion = quat
+        current = pose_bone.rotation_quaternion.copy()
+    elif pose_bone.rotation_mode == "AXIS_ANGLE":
+        current = None
+    else:
+        current = pose_bone.matrix_basis.to_euler(pose_bone.rotation_mode, previous)
+        pose_bone.rotation_euler = current
+    insert_visual_key(pose_bone, frame)
+    return current
+
+
 def apply_control_poses(source, imported, frames, action_name=None, overwrite=False):
     """Pose the driving controls so deform bones match the imported skeleton.
 
-    Deform bones are not keyed. Imported poses replace the old control keys,
-    including the original blocking poses. shortcut: update per control per
-    frame so a child solves against its posed parent.
+    Solved in world space per frame: control = desired_def @ live_def^-1 @ live_control,
+    so FK, hips and IK foot controls all land exactly. Deform bones are not keyed.
+    IK knees follow the existing pole. shortcut: three passes per frame with a view-layer
+    update per control; batch updates per hierarchy depth if long shots hitch.
     """
     if frames and not isinstance(frames[0], tuple):
         frames = [(frame, frame) for frame in frames]
@@ -600,31 +507,34 @@ def apply_control_poses(source, imported, frames, action_name=None, overwrite=Fa
         action = _ensure_action(source, action_name)
     slot = source.animation_data.action_slot
     span = [frame for frame, _imported in frames]
-    _clear_range(
-        action,
-        slot,
-        list(targets) + [bone.name for bone in source.data.bones if bone.use_deform],
-        min(span),
-        max(span),
-    )
+    _clear_range(action, slot, list(targets), min(span), max(span))
 
     scene = bpy.context.scene
-    order = _parent_first(source, set(targets))
+    order = sorted(targets, key=lambda name: len(source.pose.bones[name].parent_recursive))
+    to_local = source.matrix_world.inverted()
+    previous = {}
     for source_frame, imported_frame in frames:
         scene.frame_set(imported_frame)
         bpy.context.view_layer.update()
-        desired = {}
-        for control, (mechanism, def_name, imported_name) in targets.items():
-            world = imported.matrix_world @ imported.pose.bones[imported_name].matrix
-            desired[control] = source.matrix_world.inverted() @ world
+        desired = {
+            control: to_local @ imported.matrix_world @ imported.pose.bones[imported_name].matrix
+            for control, (_def_name, imported_name) in targets.items()
+        }
         scene.frame_set(source_frame)
+        bpy.context.view_layer.update()
+        solved = {}
+        for control, (def_name, _imported_name) in targets.items():
+            live_def = source.pose.bones[def_name].matrix
+            solved[control] = desired[control] @ live_def.inverted() @ source.pose.bones[control].matrix
+        # Pass 1 poses parent-first. Later passes correct for parents that hang off an
+        # IK solve and for the control's own constraints (FK-toe's Armature constraint).
+        placed = dict(solved)
+        for _pass in range(3):
+            for control in order:
+                pose_bone = source.pose.bones[control]
+                pose_bone.matrix = placed[control]
+                bpy.context.view_layer.update()
+                placed[control] = solved[control] @ pose_bone.matrix.inverted() @ placed[control]
         for control in order:
-            mechanism, def_name, _imported_name = targets[control]
-            def_bone = source.pose.bones[def_name].bone
-            mech_bone = source.pose.bones[mechanism].bone
-            source.pose.bones[control].matrix = (
-                desired[control] @ def_bone.matrix_local.inverted() @ mech_bone.matrix_local
-            )
-            bpy.context.view_layer.update()
-            insert_visual_key(source.pose.bones[control], source_frame)
+            previous[control] = _key_compatible(source.pose.bones[control], source_frame, previous.get(control))
     return len(targets)

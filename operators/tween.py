@@ -128,7 +128,7 @@ class CBB_OT_tween_blocked_animation(OperatorBaseClass):
         self._apply_result(context, files[0])
         for path in files:
             file_handling.delete_file(path)
-        note = "Tweened animation applied."
+        note = f"Tweened animation applied to {self.written} controls."
         if self.skipped_gaps:
             note += " Gaps longer than 120 frames were left linear."
         self.report({"INFO"}, note)
@@ -163,14 +163,18 @@ class CBB_OT_tween_blocked_animation(OperatorBaseClass):
         imported_arm = imported[0]
         imported_arm.matrix_world = armature.matrix_world.copy()
 
-        if not self.overwrite:
-            tween.copy_action(armature, action, slot)
+        animation = armature.animation_data
+        animation.action = action
+        if slot is not None:
+            animation.action_slot = slot
         pairs = tween.frame_pairs(
             imported_arm.animation_data.action if imported_arm.animation_data else None,
             self.frames[0],
             self.frames[-1],
         )
-        tween.apply_control_tween(armature, imported_arm, pairs, self.frames)
+        self.written = tween.apply_control_poses(
+            armature, imported_arm, pairs, overwrite=self.overwrite
+        )
 
         for obj in [obj for obj in bpy.data.objects if obj not in before]:
             bpy.data.objects.remove(obj, do_unlink=True)
