@@ -425,12 +425,42 @@ class OperatorBaseClass(bpy.types.Operator):
             area.tag_redraw()
 
 
-def _selected_armature(context):
-    armature = context.active_object
-    if armature is not None and armature.type == "ARMATURE":
-        return armature
-    selected = [obj for obj in context.selected_objects if obj.type == "ARMATURE"]
-    return selected[0] if selected else None
+def _export_one_armature(context, armature, path, file_format):
+    """Export one armature. The rest of a multi-rig scene stays here."""
+    previous_active = context.view_layer.objects.active
+    previous_selected = list(context.selected_objects)
+    previous_mode = previous_active.mode if previous_active else "OBJECT"
+    if file_format == "fbx":
+        props = context.scene.cbb_settings.blender_fbx_export
+        flag = "cbb_use_selection"
+    else:
+        props = context.scene.cbb_settings.blender_glb_export
+        flag = "cbb_selection"
+    old_flag = getattr(props, flag)
+    try:
+        bpy.ops.object.select_all(action="DESELECT")
+        armature.select_set(True)
+        context.view_layer.objects.active = armature
+        if armature.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        setattr(props, flag, True)
+        if file_format == "fbx":
+            export_fbx(path)
+        else:
+            export_glb(path)
+    except Exception as error:
+        return str(error)
+    finally:
+        setattr(props, flag, old_flag)
+        bpy.ops.object.select_all(action="DESELECT")
+        for obj in previous_selected:
+            if obj.name in bpy.data.objects:
+                obj.select_set(True)
+        if previous_active and previous_active.name in bpy.data.objects:
+            context.view_layer.objects.active = previous_active
+            if previous_mode != "OBJECT" and previous_active.mode != previous_mode:
+                bpy.ops.object.mode_set(mode=previous_mode)
+    return None
 
 
 class CBB_OT_export_blender_fbx(OperatorBaseClass):
@@ -441,7 +471,12 @@ class CBB_OT_export_blender_fbx(OperatorBaseClass):
 
     def execute(self, context):
         self.deform_export = False
-        armature = _selected_armature(context)
+        self.plain_export = False
+        armature = tween.active_armature(context)
+        rigs = [obj for obj in context.scene.objects if obj.type == "ARMATURE"]
+        if len(rigs) > 1 and armature is None:
+            self.report({"ERROR"}, "Make the rig you want the active object.")
+            return {"CANCELLED"}
         if armature is not None and tween.is_control_rig(armature):
             self.file_format = "fbx"
             self.file_path = file_handling.get_export_path("fbx")
@@ -450,10 +485,18 @@ class CBB_OT_export_blender_fbx(OperatorBaseClass):
                 self.report({"ERROR"}, error)
                 return {"CANCELLED"}
             self.deform_export = True
+        elif armature is not None and len(rigs) > 1:
+            self.file_format = context.scene.cbb_settings.blender_to_cascadeur.cbb_file_format
+            self.file_path = file_handling.get_export_path(self.file_format)
+            error = _export_one_armature(context, armature, self.file_path, self.file_format)
+            if error:
+                self.report({"ERROR"}, error)
+                return {"CANCELLED"}
+            self.plain_export = True
         return super().execute(context)
 
     def on_execute(self, context):
-        if not getattr(self, "deform_export", False):
+        if not getattr(self, "deform_export", False) and not getattr(self, "plain_export", False):
             self.file_format = (
                 context.scene.cbb_settings.blender_to_cascadeur.cbb_file_format
             )
@@ -609,8 +652,7 @@ class CBB_OT_import_action_to_selected(OperatorBaseClass):
 
     @classmethod
     def poll(cls, context):
-        selected = context.selected_objects
-        return bool(selected) and any(obj.type == "ARMATURE" for obj in selected)
+        return tween.active_armature(context) is not None
 
     def on_execute(self, context):
         # Store the current selection because importing FBXs changes it
@@ -684,13 +726,10 @@ class CBB_OT_import_action_to_selected(OperatorBaseClass):
 
             actions = action_handling.get_imported_actions(objects)
 
-            selected_armatures = [
-                obj for obj in self.selected_objects if obj.type == "ARMATURE"
-            ]
-            control_rigs = [obj for obj in selected_armatures if tween.is_control_rig(obj)]
+            armature = self.ao if self.ao and self.ao.type == "ARMATURE" else None
             imported_arm = next((obj for obj in objects if obj.type == "ARMATURE"), None)
 
-            if control_rigs:
+            if armature is not None and tween.is_control_rig(armature):
                 if imported_arm is None:
                     self.report({"ERROR"}, "Cascadeur export had no armature.")
                     self.cleanup(context)
@@ -698,28 +737,29 @@ class CBB_OT_import_action_to_selected(OperatorBaseClass):
                 imported_action = (
                     imported_arm.animation_data.action if imported_arm.animation_data else None
                 )
-                for armature in control_rigs:
-                    action, slot = tween.blocking_action(armature)
-                    keyed = tween.keyed_frames(action, slot) if action else []
-                    our_start = keyed[0] if keyed else context.scene.frame_start
-                    written = tween.apply_control_poses(
-                        armature,
-                        imported_arm,
-                        tween.pose_frame_pairs(imported_action, our_start),
-                        scene_name,
+                written = tween.apply_control_poses(
+                    armature,
+                    imported_arm,
+                    tween.pose_frame_pairs(
+                        imported_action,
+                        context.scene.frame_start,
+                        context.scene.frame_end,
+                    ),
+                    None if tween.overwrite_action(context) else scene_name,
+                    overwrite=tween.overwrite_action(context),
+                )
+                if not written:
+                    self.report(
+                        {"WARNING"},
+                        f"{armature.name} had no controls to receive the Cascadeur pose.",
                     )
-                    if not written:
-                        self.report(
-                            {"WARNING"},
-                            f"{armature.name} had no controls to receive the Cascadeur pose.",
-                        )
                 for action_data in actions:
                     action_data.action.use_fake_user = False
                     self._drop_actions.append(action_data.action)
             else:
-                # Copy the imported actions onto the user's selected armatures
+                # The active rig only. Other selected rigs are left alone.
                 action_handling.apply_action(
-                    selected_armatures,
+                    [armature] if armature is not None else [],
                     actions,
                     scene_name,
                 )

@@ -30,7 +30,7 @@ class CBB_PT_parent_panel(PanelBasics, bpy.types.Panel):
 
         self._draw_cascadeur_controls(layout)
         layout.separator(type="LINE", factor=2)
-        self._draw_blender_to_cascadeur(layout, addon_props)
+        self._draw_blender_to_cascadeur(context, layout, addon_props)
         layout.separator(type="LINE", factor=2)
         self._draw_cascadeur_to_blender(layout, addon_props)
 
@@ -91,7 +91,7 @@ class CBB_PT_parent_panel(PanelBasics, bpy.types.Panel):
         else:
             return False
 
-    def _draw_blender_to_cascadeur(self, layout, addon_props):
+    def _draw_blender_to_cascadeur(self, context, layout, addon_props):
         box = layout.box()
         col = box.column()
 
@@ -117,6 +117,8 @@ class CBB_PT_parent_panel(PanelBasics, bpy.types.Panel):
             text="Tween Blocked Animation",
             icon="IPO_BEZIER",
         )
+        if hasattr(context.scene, "cbb_overwrite_action"):
+            col.prop(context.scene, "cbb_overwrite_action")
 
     def _draw_cascadeur_to_blender(self, layout, addon_props):
         box = layout.box()

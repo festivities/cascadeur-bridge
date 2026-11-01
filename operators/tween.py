@@ -16,7 +16,7 @@ class CBB_OT_tween_blocked_animation(OperatorBaseClass):
 
     @classmethod
     def poll(cls, context):
-        return any(obj.type == "ARMATURE" for obj in context.selected_objects)
+        return tween.active_armature(context) is not None
 
     def execute(self, context):
         error = self._prepare(context)
@@ -26,27 +26,28 @@ class CBB_OT_tween_blocked_animation(OperatorBaseClass):
         return super().execute(context)
 
     def _prepare(self, context):
-        armature = context.active_object
-        if armature is None or armature.type != "ARMATURE":
-            selected = [obj for obj in context.selected_objects if obj.type == "ARMATURE"]
-            armature = selected[0] if selected else None
+        armature = tween.active_armature(context)
         if armature is None:
-            return "Select the armature you blocked."
+            return "Make the rig you want the active object."
+        if not tween.is_control_rig(armature):
+            return "Tween writes onto the controls that drive deform bones. This rig has none."
 
         action, slot = tween.blocking_action(armature)
         if action is None:
             return "Assign the blocked action to the armature first."
-        frames = tween.keyed_frames(action, slot)
+        scene = context.scene
+        if scene.frame_end - scene.frame_start > MAX_FRAMES:
+            return f"Frame range is longer than {MAX_FRAMES} frames."
+        frames = tween.shot_frames(action, slot, scene.frame_start, scene.frame_end)
         if len(frames) < 2:
-            return "The action needs at least two keyed frames."
-        if frames[-1] - frames[0] > MAX_FRAMES:
-            return f"Blocking range is longer than {MAX_FRAMES} frames."
+            return "The frame range needs at least two frames."
 
         self.armature_name = armature.name
         self.action_name = action.name
         self.slot_identifier = slot.identifier if slot else None
         self.frames = frames
-        self.export_start = frames[0]
+        self.export_start = scene.frame_start
+        self.overwrite = tween.overwrite_action(context)
         self.file_path = file_handling.get_export_path("fbx")
         self.result_path = None
         self.skipped_gaps = []
@@ -54,20 +55,14 @@ class CBB_OT_tween_blocked_animation(OperatorBaseClass):
         previous_active = context.view_layer.objects.active
         previous_selected = [obj for obj in context.selected_objects]
         previous_mode = previous_active.mode if previous_active else "OBJECT"
-        scene = context.scene
-        previous_range = (scene.frame_start, scene.frame_end, scene.frame_current)
-
         deform = tween.build_deform_armature(armature, armature.name + "_csc_block")
         try:
             tween.key_blocking_poses(armature, deform, frames)
             bpy.ops.object.select_all(action="DESELECT")
             deform.select_set(True)
             context.view_layer.objects.active = deform
-            scene.frame_start = frames[0]
-            scene.frame_end = frames[-1]
             self._export_deform(self.file_path)
         finally:
-            scene.frame_start, scene.frame_end, scene.frame_current = previous_range
             if deform.name in bpy.data.objects:
                 bpy.data.objects.remove(deform, do_unlink=True)
 
@@ -168,7 +163,8 @@ class CBB_OT_tween_blocked_animation(OperatorBaseClass):
         imported_arm = imported[0]
         imported_arm.matrix_world = armature.matrix_world.copy()
 
-        tween.copy_action(armature, action, slot)
+        if not self.overwrite:
+            tween.copy_action(armature, action, slot)
         pairs = tween.frame_pairs(
             imported_arm.animation_data.action if imported_arm.animation_data else None,
             self.frames[0],

@@ -62,6 +62,31 @@ def keyed_frames(action, slot):
     return sorted(frames)
 
 
+def shot_frames(action, slot, start, end):
+    """Keyed frames inside the scene range. The range ends are always included."""
+    start, end = int(start), int(end)
+    if end < start:
+        start, end = end, start
+    frames = [frame for frame in (keyed_frames(action, slot) if action else []) if start <= frame <= end]
+    if start not in frames:
+        frames.insert(0, start)
+    if end not in frames:
+        frames.append(end)
+    return frames
+
+
+def active_armature(context):
+    """The selected active armature. Other rigs in the scene are ignored."""
+    obj = context.active_object
+    if obj is None or obj.type != "ARMATURE" or not obj.select_get():
+        return None
+    return obj
+
+
+def overwrite_action(context):
+    return bool(getattr(context.scene, "cbb_overwrite_action", False))
+
+
 def blocking_action(armature):
     animation = armature.animation_data
     if animation is None or animation.action is None:
@@ -244,6 +269,11 @@ def _remap_quats(samples, dst_start, dst_end):
 
 
 def _remove_fcurves(action, slot, bone_names):
+    _clear_range(action, slot, bone_names, None, None)
+
+
+def _clear_range(action, slot, bone_names, start, end):
+    """Drop keys on these bones. A start/end keeps keys outside that span."""
     prefixes = tuple(f'pose.bones["{name}"]' for name in bone_names)
     if not prefixes or slot is None or not getattr(action, "layers", None):
         return
@@ -257,7 +287,15 @@ def _remove_fcurves(action, slot, bone_names):
             if bag is None:
                 continue
             for fcurve in list(bag.fcurves):
-                if fcurve.data_path.startswith(prefixes):
+                if not fcurve.data_path.startswith(prefixes):
+                    continue
+                if start is None:
+                    bag.fcurves.remove(fcurve)
+                    continue
+                for key in list(fcurve.keyframe_points):
+                    if start - 0.001 <= key.co[0] <= end + 0.001:
+                        fcurve.keyframe_points.remove(key)
+                if len(fcurve.keyframe_points) == 0:
                     bag.fcurves.remove(fcurve)
 
 
@@ -345,11 +383,13 @@ def apply_control_tween(source, imported, frames, key_frames=None):
                 pose_bone.keyframe_insert("rotation_euler", frame=source_frame)
         written += 1
 
-    if action is not None:
-        _remove_fcurves(
+    if action is not None and frames:
+        _clear_range(
             action,
             slot,
             [bone.name for bone in source.data.bones if bone.use_deform],
+            min(frame for frame, _imported in frames),
+            max(frame for frame, _imported in frames),
         )
     return written
 
@@ -387,11 +427,11 @@ def export_blocked_deform(armature, path):
     long hold still comes back dense.
     """
     action, slot = blocking_action(armature)
-    frames = keyed_frames(action, slot) if action else []
-    if len(frames) < 2:
-        return "The action needs at least two keyed frames."
-
     scene = bpy.context.scene
+    frames = shot_frames(action, slot, scene.frame_start, scene.frame_end)
+    if scene.frame_end <= scene.frame_start or len(frames) < 2:
+        return "The frame range needs at least two frames."
+
     previous_range = (scene.frame_start, scene.frame_end, scene.frame_current)
     previous_active = bpy.context.view_layer.objects.active
     previous_selected = list(bpy.context.selected_objects)
@@ -406,8 +446,6 @@ def export_blocked_deform(armature, path):
         bpy.context.view_layer.objects.active = deform
         if deform.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
-        scene.frame_start = frames[0]
-        scene.frame_end = frames[-1]
         bpy.ops.export_scene.fbx(
             filepath=path,
             use_selection=True,
@@ -491,14 +529,20 @@ def _parent_first(armature, names):
     return sorted(names, key=_depth)
 
 
-def pose_frame_pairs(imported_action, our_start):
-    """Map an imported clip onto our frames. FBX import often starts one frame later."""
+def pose_frame_pairs(imported_action, start, end):
+    """Map an imported clip onto the scene range. FBX import often starts one frame later."""
+    start, end = int(start), int(end)
     if imported_action is None:
-        return []
-    start = int(round(imported_action.frame_range[0]))
-    end = int(round(imported_action.frame_range[1]))
-    shift = 1 if start == our_start + 1 else 0
-    return [(frame - shift, frame) for frame in range(start, end + 1)]
+        return [(frame, frame) for frame in range(start, end + 1)]
+    imported_start = int(round(imported_action.frame_range[0]))
+    imported_end = int(round(imported_action.frame_range[1]))
+    shift = 1 if imported_start == start + 1 else 0
+    pairs = []
+    for frame in range(imported_start, imported_end + 1):
+        source = frame - shift
+        if start <= source <= end:
+            pairs.append((source, frame))
+    return pairs
 
 
 def _ensure_action(armature, action_name):
@@ -516,7 +560,7 @@ def _ensure_action(armature, action_name):
     return action
 
 
-def apply_control_poses(source, imported, frames, action_name=None):
+def apply_control_poses(source, imported, frames, action_name=None, overwrite=False):
     """Pose the driving controls so deform bones match the imported skeleton.
 
     Deform bones are not keyed. Imported poses replace the old control keys,
@@ -533,12 +577,19 @@ def apply_control_poses(source, imported, frames, action_name=None):
     if not targets:
         return 0
 
-    action = _ensure_action(source, action_name)
+    animation = source.animation_data or source.animation_data_create()
+    if overwrite and animation.action is not None:
+        action = animation.action
+    else:
+        action = _ensure_action(source, action_name)
     slot = source.animation_data.action_slot
-    _remove_fcurves(
+    span = [frame for frame, _imported in frames]
+    _clear_range(
         action,
         slot,
         list(targets) + [bone.name for bone in source.data.bones if bone.use_deform],
+        min(span),
+        max(span),
     )
 
     scene = bpy.context.scene

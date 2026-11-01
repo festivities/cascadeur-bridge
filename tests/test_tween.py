@@ -88,6 +88,18 @@ def run_self_check():
     rot = got.to_quaternion().rotation_difference(desired.to_quaternion()).angle
     assert written == 1, written
     assert loc < 1e-4 and rot < 1e-4, (loc, rot)
+    applied = driver.animation_data.action
+    fk.keyframe_insert("rotation_euler", frame=10)
+    tween.apply_control_poses(driver, imported, [(1, 1)], overwrite=True)
+    assert driver.animation_data.action == applied
+    outside = [
+        key.co[0]
+        for fcurve in tween.action_fcurves(applied, driver.animation_data.action_slot)
+        if 'FK-bone' in fcurve.data_path
+        for key in fcurve.keyframe_points
+        if abs(key.co[0] - 10) < 0.01
+    ]
+    assert outside, "key outside the written range was removed"
 
     action = bpy.data.actions.new("CSC_TEST_KEYS")
     rig.animation_data_create()
@@ -98,6 +110,12 @@ def run_self_check():
     slot = rig.animation_data.action_slot
     frames = tween.keyed_frames(action, slot)
     assert frames == [1, 11], frames
+    scene = bpy.context.scene
+    old_range = (scene.frame_start, scene.frame_end)
+    scene.frame_start, scene.frame_end = 1, 20
+    assert tween.shot_frames(action, slot, 1, 20) == [1, 11, 20]
+    assert tween.shot_frames(action, slot, 5, 8) == [5, 8]
+    scene.frame_start, scene.frame_end = old_range
 
     from mathutils import Quaternion
 

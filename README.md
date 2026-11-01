@@ -86,13 +86,15 @@ The add-on is available in the **CSC Bridge** tab of Blender's **3D Viewport N-p
 
 Exports the current Blender scene/model/animation to Cascadeur.
 
-On a control rig such as CloudRig, this sends a deform-only skeleton of the keyed poses instead of the control hierarchy. The holds stay holds. Tween and tweak that skeleton in Cascadeur, then use **Import Action** with the control rig selected. A plain deform skeleton still uses the panel FBX settings.
+Only the active rig is sent when the scene has more than one. A control rig is sent as a deform skeleton of the scene frame range. A plain rig is sent as itself. Other rigs stay in Blender.
 
 #### Tween Blocked Animation
 
-Sends the active action's key poses to Cascadeur, runs inbetweening, and writes the result back as a new action named `<action>_csc_tween`.
+Sends the active rig's poses inside the scene frame range to Cascadeur, runs inbetweening, and writes the result back. Other rigs are ignored. The frame range wins over the action's full length, and keys outside that range are left alone.
 
-The armature needs at least two keyed frames. CloudRig and other control rigs keep their deform bones driven by the controls: the tween is written onto the controls you keyed, so a posed `FK` bone rotates through the in-betweens instead of the deform bone sliding off it. Gaps longer than 120 frames stay linear; Cascadeur's inbetweening cannot fill those.
+Off by default, the result is a new action named `<action>_csc_tween`. **Overwrite Action** writes into the current action instead.
+
+CloudRig and other control rigs keep their deform bones driven by the controls: the tween is written onto the controls you keyed. Gaps longer than 120 frames stay linear.
 
 Re-run **Install Requirements** after updating so Cascadeur gets the tween script.
 
@@ -100,11 +102,9 @@ Re-run **Install Requirements** after updating so Cascadeur gets the tween scrip
 
 #### Import Action
 
-Imports the animation from the current Cascadeur scene onto the **selected armatures**.
+Imports the animation from the current Cascadeur scene onto the **active** armature, inside the scene frame range. Other selected rigs are left alone.
 
-> **Note:** The selected Blender armatures must exactly match the armature in Cascadeur. A control rig does not: the poses are written onto the controls that drive the deform bones, and the deform bones are left unkeyed.
-
-This operator will import the Cascadeur scene as an fbx file, apply the imported action to the selected armature, and then delete the imported objects. The original action is kept. The new one uses the Cascadeur scene name.
+A control rig gets the poses on the controls that drive the deform bones. **Overwrite Action** writes into the current action. Off, the original action is kept and the new one uses the Cascadeur scene name.
 
 #### Import Scene
 

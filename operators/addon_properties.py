@@ -1746,10 +1746,17 @@ def register_props():
     bpy.types.Scene.cbb_settings = bpy.props.PointerProperty(
         type=CBB_PG_settings,
     )
+    bpy.types.Scene.cbb_overwrite_action = bpy.props.BoolProperty(
+        name="Overwrite Action",
+        description="Write the Cascadeur result into the active action. Off keeps that action and creates a new one. Keys outside the frame range stay",
+        default=False,
+    )
 
 
 def unregister_props():
     del bpy.types.Scene.cbb_settings
+    if hasattr(bpy.types.Scene, "cbb_overwrite_action"):
+        del bpy.types.Scene.cbb_overwrite_action
 
     for cls in reversed(PROPERTY_GROUPS):
         bpy.utils.unregister_class(cls)
