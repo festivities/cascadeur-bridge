@@ -1,6 +1,6 @@
 import bpy
 
-from ..utils import file_handling, action_handling, properties_handling
+from ..utils import file_handling, action_handling, properties_handling, tween
 from ..utils.server_socket import ServerSocket
 from ..utils.csc_handling import CascadeurHandler
 from .. import addon_info
@@ -425,29 +425,56 @@ class OperatorBaseClass(bpy.types.Operator):
             area.tag_redraw()
 
 
+def _selected_armature(context):
+    armature = context.active_object
+    if armature is not None and armature.type == "ARMATURE":
+        return armature
+    selected = [obj for obj in context.selected_objects if obj.type == "ARMATURE"]
+    return selected[0] if selected else None
+
+
 class CBB_OT_export_blender_fbx(OperatorBaseClass):
     """Exports the current blender and imports them to Cascadeur"""
 
     bl_idname = "cbb.export_blender_fbx"
     bl_label = "Export to Cascadeur"
 
-    def on_execute(self, context):
-        self.file_format = (
-            context.scene.cbb_settings.blender_to_cascadeur.cbb_file_format
-        )
-        # Export the selected objects to a temporary FBX/GLB.
-        self.file_path = file_handling.get_export_path(self.file_format)
+    def execute(self, context):
+        self.deform_export = False
+        armature = _selected_armature(context)
+        if armature is not None and tween.is_control_rig(armature):
+            self.file_format = "fbx"
+            self.file_path = file_handling.get_export_path("fbx")
+            error = tween.export_blocked_deform(armature, self.file_path)
+            if error:
+                self.report({"ERROR"}, error)
+                return {"CANCELLED"}
+            self.deform_export = True
+        return super().execute(context)
 
-        if self.file_format == "fbx":
-            export_fbx(self.file_path)
-        else:
-            export_glb(self.file_path)
+    def on_execute(self, context):
+        if not getattr(self, "deform_export", False):
+            self.file_format = (
+                context.scene.cbb_settings.blender_to_cascadeur.cbb_file_format
+            )
+            # Export the selected objects to a temporary FBX/GLB.
+            self.file_path = file_handling.get_export_path(self.file_format)
+
+            if self.file_format == "fbx":
+                export_fbx(self.file_path)
+            else:
+                export_glb(self.file_path)
 
         # Ask Cascadeur to start its importer. It will connect back to Blender.
         CascadeurHandler().execute_csc_command("scripts.blender_bridge.temp_importer")
 
     def on_connected(self, context):
-        if self.file_format == "fbx":
+        if getattr(self, "deform_export", False):
+            import_method = "import_scene"
+            import_settings = properties_handling.get_csc_fbx_settings("import")
+            import_settings["bake_animation"] = False
+            import_settings["up_axis"] = "Y"
+        elif self.file_format == "fbx":
             import_method = (
                 context.scene.cbb_settings.cascadeur_fbx_import.cbb_import_methods
             )
@@ -481,7 +508,13 @@ class CBB_OT_export_blender_fbx(OperatorBaseClass):
 
         # Delete exported file
         file_handling.delete_file(self.file_path)
-        self.report({"INFO"}, "Finished")
+        if getattr(self, "deform_export", False):
+            self.report(
+                {"INFO"},
+                "Exported the deform skeleton. Tween it in Cascadeur, then Import Action.",
+            )
+        else:
+            self.report({"INFO"}, "Finished")
         return {"FINISHED"}
 
 
@@ -584,6 +617,7 @@ class CBB_OT_import_action_to_selected(OperatorBaseClass):
         self.ao = context.active_object
         self.selected_objects = context.selected_objects.copy()
         self.imported_objects = []
+        self._drop_actions = []
 
         command = "temp_batch_exporter" if self.batch_export else "temp_exporter"
 
@@ -653,15 +687,47 @@ class CBB_OT_import_action_to_selected(OperatorBaseClass):
             selected_armatures = [
                 obj for obj in self.selected_objects if obj.type == "ARMATURE"
             ]
+            control_rigs = [obj for obj in selected_armatures if tween.is_control_rig(obj)]
+            imported_arm = next((obj for obj in objects if obj.type == "ARMATURE"), None)
 
-            # Copy the imported actions onto the user's selected armatures
-            action_handling.apply_action(
-                selected_armatures,
-                actions,
-                scene_name,
-            )
+            if control_rigs:
+                if imported_arm is None:
+                    self.report({"ERROR"}, "Cascadeur export had no armature.")
+                    self.cleanup(context)
+                    return {"CANCELLED"}
+                imported_action = (
+                    imported_arm.animation_data.action if imported_arm.animation_data else None
+                )
+                for armature in control_rigs:
+                    action, slot = tween.blocking_action(armature)
+                    keyed = tween.keyed_frames(action, slot) if action else []
+                    our_start = keyed[0] if keyed else context.scene.frame_start
+                    written = tween.apply_control_poses(
+                        armature,
+                        imported_arm,
+                        tween.pose_frame_pairs(imported_action, our_start),
+                        scene_name,
+                    )
+                    if not written:
+                        self.report(
+                            {"WARNING"},
+                            f"{armature.name} had no controls to receive the Cascadeur pose.",
+                        )
+                for action_data in actions:
+                    action_data.action.use_fake_user = False
+                    self._drop_actions.append(action_data.action)
+            else:
+                # Copy the imported actions onto the user's selected armatures
+                action_handling.apply_action(
+                    selected_armatures,
+                    actions,
+                    scene_name,
+                )
 
         delete_objects(self.imported_objects)
+        for action in getattr(self, "_drop_actions", []):
+            if action.users == 0:
+                bpy.data.actions.remove(action)
 
         # Restore the user's original selection
         bpy.ops.object.select_all(action="DESELECT")
@@ -671,7 +737,10 @@ class CBB_OT_import_action_to_selected(OperatorBaseClass):
 
         context.view_layer.objects.active = self.ao
 
-        self.report({"INFO"}, "Finished")
+        if getattr(self, "_drop_actions", None):
+            self.report({"INFO"}, "Wrote the Cascadeur poses onto the controls.")
+        else:
+            self.report({"INFO"}, "Finished")
         return {"FINISHED"}
 
 

@@ -86,6 +86,8 @@ The add-on is available in the **CSC Bridge** tab of Blender's **3D Viewport N-p
 
 Exports the current Blender scene/model/animation to Cascadeur.
 
+On a control rig such as CloudRig, this sends a deform-only skeleton of the keyed poses instead of the control hierarchy. The holds stay holds. Tween and tweak that skeleton in Cascadeur, then use **Import Action** with the control rig selected. A plain deform skeleton still uses the panel FBX settings.
+
 #### Tween Blocked Animation
 
 Sends the active action's key poses to Cascadeur, runs inbetweening, and writes the result back as a new action named `<action>_csc_tween`.
@@ -100,9 +102,9 @@ Re-run **Install Requirements** after updating so Cascadeur gets the tween scrip
 
 Imports the animation from the current Cascadeur scene onto the **selected armatures**.
 
-> **Note:** The selected Blender armatures must exactly match the armature in Cascadeur.
+> **Note:** The selected Blender armatures must exactly match the armature in Cascadeur. A control rig does not: the poses are written onto the controls that drive the deform bones, and the deform bones are left unkeyed.
 
-This operator will import the Cascadeur scene as an fbx file, apply the imported action to the selected armature, and then delete the imported objects.
+This operator will import the Cascadeur scene as an fbx file, apply the imported action to the selected armature, and then delete the imported objects. The original action is kept. The new one uses the Cascadeur scene name.
 
 #### Import Scene
 

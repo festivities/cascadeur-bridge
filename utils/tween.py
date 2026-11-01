@@ -352,3 +352,212 @@ def apply_control_tween(source, imported, frames, key_frames=None):
             [bone.name for bone in source.data.bones if bone.use_deform],
         )
     return written
+
+
+def is_control_rig(armature):
+    """Deform bones hang off controls, as in CloudRig. A plain skeleton does not."""
+    return any(
+        bone.use_deform and bone.parent and not bone.parent.use_deform
+        for bone in armature.data.bones
+    )
+
+
+def _set_constant(action, slot):
+    for fcurve in action_fcurves(action, slot):
+        for key in fcurve.keyframe_points:
+            key.interpolation = "CONSTANT"
+
+
+def _restore_view(previous_active, previous_selected, previous_mode):
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in previous_selected:
+        if obj.name in bpy.data.objects:
+            obj.select_set(True)
+    if previous_active and previous_active.name in bpy.data.objects:
+        bpy.context.view_layer.objects.active = previous_active
+        if previous_mode != "OBJECT" and previous_active.mode != previous_mode:
+            bpy.ops.object.mode_set(mode=previous_mode)
+
+
+def export_blocked_deform(armature, path):
+    """Write a deform-only FBX of the keyed poses. Holds stay holds.
+
+    The live rig is not modified. shortcut: FBX bake plus simplify, because
+    bake_anim=False writes no curves. Raise the simplify factor only if a
+    long hold still comes back dense.
+    """
+    action, slot = blocking_action(armature)
+    frames = keyed_frames(action, slot) if action else []
+    if len(frames) < 2:
+        return "The action needs at least two keyed frames."
+
+    scene = bpy.context.scene
+    previous_range = (scene.frame_start, scene.frame_end, scene.frame_current)
+    previous_active = bpy.context.view_layer.objects.active
+    previous_selected = list(bpy.context.selected_objects)
+    previous_mode = previous_active.mode if previous_active else "OBJECT"
+    deform = build_deform_armature(armature, armature.name + "_csc_export")
+    exported = deform.animation_data.action if deform.animation_data else None
+    try:
+        exported = key_blocking_poses(armature, deform, frames)
+        _set_constant(exported, deform.animation_data.action_slot)
+        bpy.ops.object.select_all(action="DESELECT")
+        deform.select_set(True)
+        bpy.context.view_layer.objects.active = deform
+        if deform.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        scene.frame_start = frames[0]
+        scene.frame_end = frames[-1]
+        bpy.ops.export_scene.fbx(
+            filepath=path,
+            use_selection=True,
+            object_types={"ARMATURE"},
+            add_leaf_bones=False,
+            bake_anim=True,
+            bake_anim_use_all_bones=False,
+            bake_anim_use_nla_strips=False,
+            bake_anim_use_all_actions=False,
+            bake_anim_force_startend_keying=True,
+            bake_anim_step=1,
+            bake_anim_simplify_factor=0.01,
+            axis_forward="-Z",
+            axis_up="Y",
+        )
+    except Exception as error:
+        return str(error)
+    finally:
+        scene.frame_start, scene.frame_end, scene.frame_current = previous_range
+        if deform.name in bpy.data.objects:
+            bpy.data.objects.remove(deform, do_unlink=True)
+        if exported is not None:
+            exported.use_fake_user = False
+            if exported.users == 0:
+                bpy.data.actions.remove(exported)
+        _restore_view(previous_active, previous_selected, previous_mode)
+    return None
+
+
+def _mechanism_driver(armature, def_name):
+    pose_bone = armature.pose.bones.get(def_name)
+    node = pose_bone.parent if pose_bone else None
+    while node:
+        for constraint in node.constraints:
+            if (
+                constraint.type == "COPY_TRANSFORMS"
+                and getattr(constraint, "influence", 1.0) > 0.5
+                and constraint.subtarget in armature.pose.bones
+            ):
+                return node.name, constraint.subtarget
+        node = node.parent
+    return None, None
+
+
+def _imported_name(imported, def_name):
+    if def_name in imported.pose.bones:
+        return def_name
+    stripped = def_name[4:] if def_name.startswith("DEF-") else None
+    if stripped and stripped in imported.pose.bones:
+        return stripped
+    return None
+
+
+def _control_targets(source, imported):
+    driven = {}
+    for name in source.pose.bones.keys():
+        if not source.pose.bones[name].bone.use_deform:
+            continue
+        imported_name = _imported_name(imported, name)
+        if imported_name is None:
+            continue
+        mechanism, control = _mechanism_driver(source, name)
+        if not control:
+            continue
+        preferred = _deform_name(control)
+        if control not in driven or name == preferred:
+            driven[control] = (mechanism, name, imported_name)
+    return driven
+
+
+def _parent_first(armature, names):
+    depth = {}
+
+    def _depth(name):
+        if name in depth:
+            return depth[name]
+        parent = armature.pose.bones[name].parent
+        depth[name] = 0 if parent is None or parent.name not in names else _depth(parent.name) + 1
+        return depth[name]
+
+    return sorted(names, key=_depth)
+
+
+def pose_frame_pairs(imported_action, our_start):
+    """Map an imported clip onto our frames. FBX import often starts one frame later."""
+    if imported_action is None:
+        return []
+    start = int(round(imported_action.frame_range[0]))
+    end = int(round(imported_action.frame_range[1]))
+    shift = 1 if start == our_start + 1 else 0
+    return [(frame - shift, frame) for frame in range(start, end + 1)]
+
+
+def _ensure_action(armature, action_name):
+    animation = armature.animation_data or armature.animation_data_create()
+    if animation.action is not None:
+        action = copy_action(armature, animation.action, animation.action_slot)
+        if action_name:
+            action.name = action_name
+        return action
+    action = bpy.data.actions.new(action_name or armature.name + "_csc")
+    action.use_fake_user = True
+    animation.action = action
+    if getattr(action, "slots", None) and animation.action_slot is None:
+        animation.action_slot = action.slots[0]
+    return action
+
+
+def apply_control_poses(source, imported, frames, action_name=None):
+    """Pose the driving controls so deform bones match the imported skeleton.
+
+    Deform bones are not keyed. Imported poses replace the old control keys,
+    including the original blocking poses. shortcut: update per control per
+    frame so a child solves against its posed parent.
+    """
+    if frames and not isinstance(frames[0], tuple):
+        frames = [(frame, frame) for frame in frames]
+    if not frames:
+        return 0
+
+    imported.matrix_world = source.matrix_world.copy()
+    targets = _control_targets(source, imported)
+    if not targets:
+        return 0
+
+    action = _ensure_action(source, action_name)
+    slot = source.animation_data.action_slot
+    _remove_fcurves(
+        action,
+        slot,
+        list(targets) + [bone.name for bone in source.data.bones if bone.use_deform],
+    )
+
+    scene = bpy.context.scene
+    order = _parent_first(source, set(targets))
+    for source_frame, imported_frame in frames:
+        scene.frame_set(imported_frame)
+        bpy.context.view_layer.update()
+        desired = {}
+        for control, (mechanism, def_name, imported_name) in targets.items():
+            world = imported.matrix_world @ imported.pose.bones[imported_name].matrix
+            desired[control] = source.matrix_world.inverted() @ world
+        scene.frame_set(source_frame)
+        for control in order:
+            mechanism, def_name, _imported_name = targets[control]
+            def_bone = source.pose.bones[def_name].bone
+            mech_bone = source.pose.bones[mechanism].bone
+            source.pose.bones[control].matrix = (
+                desired[control] @ def_bone.matrix_local.inverted() @ mech_bone.matrix_local
+            )
+            bpy.context.view_layer.update()
+            insert_visual_key(source.pose.bones[control], source_frame)
+    return len(targets)

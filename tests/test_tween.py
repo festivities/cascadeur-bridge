@@ -51,6 +51,43 @@ def run_self_check():
     )
     parents = tween.deform_parent_map(rig)
     assert parents["DEF-upper_arm.L"] == "DEF-spine", parents
+    assert tween.is_control_rig(rig)
+    assert not tween.is_control_rig(plain)
+
+    driver = _armature(
+        "CSC_TEST_DRIVER",
+        [
+            ("FK-bone", None, (0, 0, 0), (0, 0, 1), False),
+            ("mech", None, (0, 0, 0), (0, 0, 1), False),
+            ("DEF-bone", "mech", (0, 0, 0), (0, 0, 1), True),
+        ],
+    )
+    copy = driver.pose.bones["mech"].constraints.new("COPY_TRANSFORMS")
+    copy.target = driver
+    copy.subtarget = "FK-bone"
+    copy.owner_space = "WORLD"
+    copy.target_space = "WORLD"
+    fk = driver.pose.bones["FK-bone"]
+    fk.rotation_mode = "XYZ"
+    fk.rotation_euler = (0.4, 0.2, 0.0)
+    bpy.context.view_layer.update()
+    desired = driver.pose.bones["DEF-bone"].matrix.copy()
+    imported = _armature(
+        "CSC_TEST_IMPORT",
+        [("DEF-bone", None, (0, 0, 0), (0, 0, 1), True)],
+    )
+    imported_bone = imported.pose.bones["DEF-bone"]
+    imported_bone.matrix = desired
+    tween.insert_visual_key(imported_bone, 1)
+    fk.rotation_euler = (0, 0, 0)
+    written = tween.apply_control_poses(driver, imported, [(1, 1)], "CSC_TEST_APPLIED")
+    bpy.context.scene.frame_set(1)
+    bpy.context.view_layer.update()
+    got = driver.pose.bones["DEF-bone"].matrix
+    loc = (got.inverted() @ desired).to_translation().length
+    rot = got.to_quaternion().rotation_difference(desired.to_quaternion()).angle
+    assert written == 1, written
+    assert loc < 1e-4 and rot < 1e-4, (loc, rot)
 
     action = bpy.data.actions.new("CSC_TEST_KEYS")
     rig.animation_data_create()
@@ -71,6 +108,11 @@ def run_self_check():
     assert (remapped[0] - start).magnitude < 1e-5, remapped[0]
     assert (remapped[-1] - end).magnitude < 1e-5, remapped[-1]
 
-    for obj in (plain, rig):
+    for obj in (plain, rig, driver, imported):
         bpy.data.objects.remove(obj, do_unlink=True)
+    for action in list(bpy.data.actions):
+        if action.name.startswith("CSC_TEST"):
+            action.use_fake_user = False
+            if action.users == 0:
+                bpy.data.actions.remove(action)
     return "ok"
